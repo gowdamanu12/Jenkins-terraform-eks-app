@@ -5,7 +5,7 @@ pipeline {
         // The first choice is the default, so a webhook-triggered build only runs a plan.
         choice(name: 'ACTION', choices: ['plan-only', 'apply', 'destroy'],
                description: 'plan-only = just show the plan, apply = create/update infra and deploy the app, destroy = delete the app and tear everything down')
-        string(name: 'AWS_REGION',   defaultValue: 'ap-south-1', description: 'AWS region')
+        string(name: 'AWS_REGION',   defaultValue: 'ap-southeast-2', description: 'AWS region')
         string(name: 'CLUSTER_NAME', defaultValue: 'my-eks',     description: 'EKS cluster name')
         string(name: 'K8S_VERSION',  defaultValue: '1.33',       description: 'Kubernetes version')
         string(name: 'APP_NAME',     defaultValue: 'myapp',      description: 'Application / ECR repository name (must match the name in app.yaml)')
