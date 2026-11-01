@@ -51,6 +51,10 @@ module "eks" {
 
   cluster_endpoint_public_access = true
 
+  # The AWS Organization's service control policy denies iam:CreateOpenIDConnectProvider,
+  # so the IRSA OIDC provider cannot be created in this account.
+  enable_irsa = false
+
   # Gives the identity that runs Terraform (the Jenkins IAM role/user)
   # cluster-admin access via an EKS access entry.
   enable_cluster_creator_admin_permissions = true
