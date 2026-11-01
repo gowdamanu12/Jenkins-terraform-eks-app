@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.11.0"
 
   required_providers {
     aws = {
@@ -8,14 +8,16 @@ terraform {
     }
   }
 
-  # Remote state in S3 with DynamoDB locking.
+  # Remote state in S3 with S3-native locking (use_lockfile).
   # Backend blocks cannot use variables, so the values are written directly.
+  # The backend region is the region of the BUCKET and is independent of the
+  # region the EKS cluster is created in (var.region).
   backend "s3" {
-    bucket         = "my-terraform-state-bucket-12-345"
-    key            = "eks/my-eks/terraform.tfstate"
-    region         = "ap-south-1" # must be the region the bucket was created in
-    dynamodb_table = "terraform-locks"
-    encrypt        = true
+    bucket       = "my-terraform-state-bucket-12-345"
+    key          = "eks/my-eks/terraform.tfstate"
+    region       = "ap-southeast-2" # region where the bucket was created
+    use_lockfile = true
+    encrypt      = true
   }
 }
 
