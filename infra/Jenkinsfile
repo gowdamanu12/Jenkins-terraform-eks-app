@@ -2,8 +2,9 @@ pipeline {
     agent any
 
     parameters {
-        choice(name: 'ACTION', choices: ['apply', 'plan-only', 'destroy'],
-               description: 'apply = create/update infra and deploy the app, plan-only = just show the plan, destroy = delete the app and tear everything down')
+        // The first choice is the default, so a webhook-triggered build only runs a plan.
+        choice(name: 'ACTION', choices: ['plan-only', 'apply', 'destroy'],
+               description: 'plan-only = just show the plan, apply = create/update infra and deploy the app, destroy = delete the app and tear everything down')
         string(name: 'AWS_REGION',   defaultValue: 'ap-south-1', description: 'AWS region')
         string(name: 'CLUSTER_NAME', defaultValue: 'my-eks',     description: 'EKS cluster name')
         string(name: 'K8S_VERSION',  defaultValue: '1.33',       description: 'Kubernetes version')
@@ -15,9 +16,11 @@ pipeline {
     }
 
     environment {
-        // State bucket and DynamoDB lock table are configured in versions.tf
-        TF_IN_AUTOMATION = 'true'
-        TF_INPUT         = '0'
+        // AWS access comes from the EC2 instance role (jenkins-ec2-role), so no keys are stored in Jenkins.
+        // The state bucket and DynamoDB lock table are configured in versions.tf.
+        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+        TF_IN_AUTOMATION   = 'true'
+        TF_INPUT           = '0'
     }
 
     options {
@@ -40,6 +43,7 @@ pipeline {
                     terraform version
                     aws --version
                     kubectl version --client
+                    aws sts get-caller-identity
                 '''
                 script {
                     if (params.ACTION == 'apply' && params.DEPLOY_APP) {
@@ -51,15 +55,7 @@ pipeline {
 
         stage('Terraform Init') {
             steps {
-                // Credentials ID must exist in Jenkins (Kind: "AWS Credentials").
-                // If Jenkins runs on EC2 with an instance profile, remove the withCredentials wrappers.
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    sh '''
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
-                        terraform init -upgrade
-                    '''
-                }
+                sh 'terraform init -upgrade'
             }
         }
 
@@ -74,20 +70,16 @@ pipeline {
 
         stage('Terraform Plan') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    script {
-                        def destroyFlag = (params.ACTION == 'destroy') ? '-destroy' : ''
-                        sh """
-                            export AWS_DEFAULT_REGION=${params.AWS_REGION}
-                            terraform plan ${destroyFlag} \
-                              -var region=${params.AWS_REGION} \
-                              -var cluster_name=${params.CLUSTER_NAME} \
-                              -var k8s_version=${params.K8S_VERSION} \
-                              -var app_name=${params.APP_NAME} \
-                              -out=tfplan
-                        """
-                    }
+                script {
+                    def destroyFlag = (params.ACTION == 'destroy') ? '-destroy' : ''
+                    sh """
+                        terraform plan ${destroyFlag} \
+                          -var region=${params.AWS_REGION} \
+                          -var cluster_name=${params.CLUSTER_NAME} \
+                          -var k8s_version=${params.K8S_VERSION} \
+                          -var app_name=${params.APP_NAME} \
+                          -out=tfplan
+                    """
                 }
             }
         }
@@ -112,19 +104,15 @@ pipeline {
                 expression { params.ACTION == 'destroy' }
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    sh '''
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
-                        if aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}; then
-                            sed "s|IMAGE_PLACEHOLDER|placeholder|" app.yaml | kubectl delete -f - --ignore-not-found=true --wait=true || true
-                            # give AWS a moment to release the load balancer and its ENIs
-                            sleep 60
-                        else
-                            echo "Cluster not reachable; skipping app deletion."
-                        fi
-                    '''
-                }
+                sh '''
+                    if aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}; then
+                        sed "s|IMAGE_PLACEHOLDER|placeholder|" app.yaml | kubectl delete -f - --ignore-not-found=true --wait=true || true
+                        # give AWS a moment to release the load balancer and its ENIs
+                        sleep 60
+                    else
+                        echo "Cluster not reachable; skipping app deletion."
+                    fi
+                '''
             }
         }
 
@@ -133,13 +121,7 @@ pipeline {
                 expression { params.ACTION != 'plan-only' }
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    sh '''
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
-                        terraform apply -auto-approve tfplan
-                    '''
-                }
+                sh 'terraform apply -auto-approve tfplan'
             }
         }
 
@@ -151,25 +133,21 @@ pipeline {
                 }
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    script {
-                        env.ECR_URL = sh(script: 'terraform output -raw ecr_repository_url', returnStdout: true).trim()
-                        def shortSha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                        env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortSha}"
-                        env.IMAGE_URI = "${env.ECR_URL}:${env.IMAGE_TAG}"
-                    }
-                    sh '''
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
-                        ECR_HOST=$(echo "${ECR_URL}" | cut -d/ -f1)
-                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_HOST}
-
-                        # Uses the Dockerfile in the repo root. Change the context path if yours is elsewhere.
-                        docker build -t ${IMAGE_URI} -t ${ECR_URL}:latest .
-                        docker push ${IMAGE_URI}
-                        docker push ${ECR_URL}:latest
-                    '''
+                script {
+                    env.ECR_URL = sh(script: 'terraform output -raw ecr_repository_url', returnStdout: true).trim()
+                    def shortSha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortSha}"
+                    env.IMAGE_URI = "${env.ECR_URL}:${env.IMAGE_TAG}"
                 }
+                sh '''
+                    ECR_HOST=$(echo "${ECR_URL}" | cut -d/ -f1)
+                    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_HOST}
+
+                    # Uses the Dockerfile in the repo root. Change the context path if yours is elsewhere.
+                    docker build -t ${IMAGE_URI} -t ${ECR_URL}:latest .
+                    docker push ${IMAGE_URI}
+                    docker push ${ECR_URL}:latest
+                '''
             }
         }
 
@@ -181,17 +159,13 @@ pipeline {
                 }
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    sh '''
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
-                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                sh '''
+                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
 
-                        sed "s|IMAGE_PLACEHOLDER|${IMAGE_URI}|g" app.yaml > app-rendered.yaml
-                        kubectl apply -f app-rendered.yaml
-                        kubectl rollout status deployment/${APP_NAME} --timeout=300s
-                    '''
-                }
+                    sed "s|IMAGE_PLACEHOLDER|${IMAGE_URI}|g" app.yaml > app-rendered.yaml
+                    kubectl apply -f app-rendered.yaml
+                    kubectl rollout status deployment/${APP_NAME} --timeout=300s
+                '''
             }
         }
 
@@ -200,17 +174,13 @@ pipeline {
                 expression { params.ACTION == 'apply' }
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: 'aws-credentials']]) {
-                    sh '''
-                        export AWS_DEFAULT_REGION=${AWS_REGION}
-                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
-                        kubectl get nodes -o wide
-                        kubectl get pods -A
-                        kubectl get svc ${APP_NAME} || true
-                        echo "The EXTERNAL-IP / hostname may take 2-3 minutes to appear for a new LoadBalancer."
-                    '''
-                }
+                sh '''
+                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                    kubectl get nodes -o wide
+                    kubectl get pods -A
+                    kubectl get svc ${APP_NAME} || true
+                    echo "The EXTERNAL-IP / hostname may take 2-3 minutes to appear for a new LoadBalancer."
+                '''
             }
         }
     }
