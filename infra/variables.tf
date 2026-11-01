@@ -1,0 +1,62 @@
+variable "region" {
+  description = "AWS region"
+  type        = string
+  default     = "ap-south-1"
+}
+
+variable "cluster_name" {
+  description = "EKS cluster name"
+  type        = string
+  default     = "my-eks"
+}
+
+variable "environment" {
+  description = "Environment tag (dev, stage, prod)"
+  type        = string
+  default     = "dev"
+}
+
+variable "k8s_version" {
+  description = "Kubernetes version (use one that EKS currently supports)"
+  type        = string
+  default     = "1.33"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "az_count" {
+  description = "Number of availability zones to use"
+  type        = number
+  default     = 2
+}
+
+variable "node_instance_types" {
+  description = "EC2 instance types for the managed node group"
+  type        = list(string)
+  default     = ["t3.medium"]
+}
+
+variable "node_min_size" {
+  type    = number
+  default = 1
+}
+
+variable "node_max_size" {
+  type    = number
+  default = 3
+}
+
+variable "node_desired_size" {
+  type    = number
+  default = 2
+}
+
+variable "single_nat_gateway" {
+  description = "Use one NAT gateway (cheaper) instead of one per AZ (more resilient)"
+  type        = bool
+  default     = true
+}

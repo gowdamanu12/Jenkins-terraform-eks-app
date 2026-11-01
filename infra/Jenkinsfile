@@ -1,0 +1,230 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ACTION', choices: ['apply', 'plan-only', 'destroy'],
+               description: 'apply = create/update infra and deploy the app, plan-only = just show the plan, destroy = delete the app and tear everything down')
+        string(name: 'AWS_REGION',   defaultValue: 'ap-south-1', description: 'AWS region')
+        string(name: 'CLUSTER_NAME', defaultValue: 'my-eks',     description: 'EKS cluster name')
+        string(name: 'K8S_VERSION',  defaultValue: '1.33',       description: 'Kubernetes version')
+        string(name: 'APP_NAME',     defaultValue: 'myapp',      description: 'Application / ECR repository name (must match the name in app.yaml)')
+        booleanParam(name: 'DEPLOY_APP', defaultValue: true,
+                     description: 'Build the Docker image, push to ECR and deploy to EKS (only with ACTION=apply)')
+        booleanParam(name: 'AUTO_APPROVE', defaultValue: false,
+                     description: 'Skip the manual approval step (not recommended for prod)')
+    }
+
+    environment {
+        // State bucket and DynamoDB lock table are configured in versions.tf
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT         = '0'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Tool check') {
+            steps {
+                sh '''
+                    terraform version
+                    aws --version
+                    kubectl version --client
+                '''
+                script {
+                    if (params.ACTION == 'apply' && params.DEPLOY_APP) {
+                        sh 'docker --version'
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                // Credentials ID must exist in Jenkins (Kind: "AWS Credentials").
+                // If Jenkins runs on EC2 with an instance profile, remove the withCredentials wrappers.
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        terraform init -upgrade
+                    '''
+                }
+            }
+        }
+
+        stage('Validate') {
+            steps {
+                sh '''
+                    terraform fmt -check -recursive
+                    terraform validate
+                '''
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    script {
+                        def destroyFlag = (params.ACTION == 'destroy') ? '-destroy' : ''
+                        sh """
+                            export AWS_DEFAULT_REGION=${params.AWS_REGION}
+                            terraform plan ${destroyFlag} \
+                              -var region=${params.AWS_REGION} \
+                              -var cluster_name=${params.CLUSTER_NAME} \
+                              -var k8s_version=${params.K8S_VERSION} \
+                              -var app_name=${params.APP_NAME} \
+                              -out=tfplan
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                allOf {
+                    expression { params.ACTION != 'plan-only' }
+                    expression { !params.AUTO_APPROVE }
+                }
+            }
+            steps {
+                input message: "Review the plan above. Proceed with '${params.ACTION}' on cluster '${params.CLUSTER_NAME}'?",
+                      ok: 'Yes, proceed'
+            }
+        }
+
+        // On destroy, remove the app first so the Kubernetes LoadBalancer (ELB) is deleted.
+        // A leftover ELB would otherwise block VPC deletion.
+        stage('Delete app (before destroy)') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        if aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}; then
+                            sed "s|IMAGE_PLACEHOLDER|placeholder|" app.yaml | kubectl delete -f - --ignore-not-found=true --wait=true || true
+                            # give AWS a moment to release the load balancer and its ENIs
+                            sleep 60
+                        else
+                            echo "Cluster not reachable; skipping app deletion."
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Apply / Destroy') {
+            when {
+                expression { params.ACTION != 'plan-only' }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        terraform apply -auto-approve tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Push Image to ECR') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'apply' }
+                    expression { params.DEPLOY_APP }
+                }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    script {
+                        env.ECR_URL = sh(script: 'terraform output -raw ecr_repository_url', returnStdout: true).trim()
+                        def shortSha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                        env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortSha}"
+                        env.IMAGE_URI = "${env.ECR_URL}:${env.IMAGE_TAG}"
+                    }
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        ECR_HOST=$(echo "${ECR_URL}" | cut -d/ -f1)
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_HOST}
+
+                        # Uses the Dockerfile in the repo root. Change the context path if yours is elsewhere.
+                        docker build -t ${IMAGE_URI} -t ${ECR_URL}:latest .
+                        docker push ${IMAGE_URI}
+                        docker push ${ECR_URL}:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'apply' }
+                    expression { params.DEPLOY_APP }
+                }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+
+                        sed "s|IMAGE_PLACEHOLDER|${IMAGE_URI}|g" app.yaml > app-rendered.yaml
+                        kubectl apply -f app-rendered.yaml
+                        kubectl rollout status deployment/${APP_NAME} --timeout=300s
+                    '''
+                }
+            }
+        }
+
+        stage('Verify') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                        kubectl get nodes -o wide
+                        kubectl get pods -A
+                        kubectl get svc ${APP_NAME} || true
+                        echo "The EXTERNAL-IP / hostname may take 2-3 minutes to appear for a new LoadBalancer."
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline finished: ${params.ACTION} on ${params.CLUSTER_NAME}"
+        }
+        failure {
+            echo 'Pipeline failed. Check the stage logs above.'
+        }
+        always {
+            archiveArtifacts artifacts: 'tfplan, app-rendered.yaml', allowEmptyArchive: true
+            cleanWs()
+        }
+    }
+}
